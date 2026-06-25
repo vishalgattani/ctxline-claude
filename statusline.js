@@ -38,6 +38,9 @@ const SEGMENT_SEP = ' │ ';
 // truncates a char or two before wrapping.
 const WIDTH_MARGIN = 0;
 
+// Persistent cost ledger — same file + date format as statusline-command.sh for compat.
+const USAGE_FILE = path.join(os.homedir(), '.claude', 'usage.json');
+
 // Cache configuration
 const CACHE_DIR = path.join(os.homedir(), '.claude', 'cache');
 const USAGE_CACHE_FILE = path.join(CACHE_DIR, 'usage-cache.json');
@@ -217,23 +220,29 @@ function getContextBar(remaining) {
   return `${color}C${used} ${bar}${colors.reset}`;
 }
 
-// Render a compact usage segment from raw data: "<label><pct> ↺ <countdown>"
-// (e.g. "H81 ↺ 2h21m") — no bar. Called on every read (live or cached) so the reset
-// countdown is always recomputed from resetsAt rather than frozen at fetch time.
+// Render a compact usage segment: "<label><pct> ↺ <countdown> (HH:MM)"
+// (e.g. "H81 ↺ 2h21m (09:30)"). Called on every read so the countdown is always fresh.
 function buildUsageBar(label, percentage, resetsAt) {
   let timeStr = '';
+  let clockStr = '';
   if (resetsAt) {
-    const diffMins = Math.max(0, Math.floor((new Date(resetsAt) - new Date()) / 60000));
+    const resetDate = new Date(resetsAt);
+    const diffMins = Math.max(0, Math.floor((resetDate - new Date()) / 60000));
     const days = Math.floor(diffMins / 1440);
     const hours = Math.floor((diffMins % 1440) / 60);
     const mins = diffMins % 60;
     if (days > 0) timeStr = `${days}d${hours}h`;
     else if (hours > 0) timeStr = `${hours}h${mins}m`;
     else timeStr = `${mins}m`;
+    const hh = String(resetDate.getHours()).padStart(2, '0');
+    const mm = String(resetDate.getMinutes()).padStart(2, '0');
+    clockStr = `${hh}:${mm}`;
   }
 
   const color = getUsageColor(percentage);
-  const timePart = timeStr ? `${colors.dim} ↺ ${timeStr}${colors.reset}` : '';
+  const timePart = timeStr
+    ? `${colors.dim} ↺ ${timeStr}${clockStr ? ` (${clockStr})` : ''}${colors.reset}`
+    : '';
 
   return `${color}${label}${percentage}${colors.reset}${timePart}`;
 }
@@ -456,13 +465,49 @@ function getUsageWithCache(callback) {
   });
 }
 
-// Session cost from stdin `cost.total_cost_usd` (USD float, computed client-side by
-// Claude Code as tokens × per-model API pricing). Pure stdin — no network/cache.
-// Returns "$0.00" rendered dim, or '' when absent/non-finite so the segment is omitted.
+// Persist this session's cost into ~/.claude/usage.json (DD-MM-YYYY key, same format as
+// statusline-command.sh) and derive today's and all-time totals. Skips write when cost=0.
+// The 'entries' key in the file is a legacy migration artefact — ignored in all-time sum.
+function updateAndReadCosts(sessionId, costUsd) {
+  try {
+    const d = new Date();
+    const dateKey = `${String(d.getDate()).padStart(2,'0')}-${String(d.getMonth()+1).padStart(2,'0')}-${d.getFullYear()}`;
+
+    let usage = {};
+    try { usage = JSON.parse(fs.readFileSync(USAGE_FILE, 'utf8')); } catch (e) {}
+
+    if (sessionId && Number.isFinite(costUsd) && costUsd > 0) {
+      if (!usage[dateKey]) usage[dateKey] = {};
+      usage[dateKey][sessionId] = costUsd;
+      try { fs.writeFileSync(USAGE_FILE, JSON.stringify(usage, null, 2), 'utf8'); } catch (e) {}
+    }
+
+    const todayVals = usage[dateKey] ? Object.values(usage[dateKey]) : [];
+    const todayTotal = todayVals.reduce((a, b) => a + b, 0);
+
+    let allTotal = 0;
+    for (const [key, val] of Object.entries(usage)) {
+      if (key === 'entries' || typeof val !== 'object' || val === null) continue;
+      allTotal += Object.values(val).reduce((a, b) => a + b, 0);
+    }
+
+    return { today: todayTotal, total: allTotal };
+  } catch (e) {
+    return { today: 0, total: 0 };
+  }
+}
+
+// Session cost from stdin + persisted today/total. Returns multi-part cost string or ''
+// when cost is absent/non-finite (segment omitted entirely).
 function getCostSegment(data) {
   const usd = data?.cost?.total_cost_usd;
   if (!Number.isFinite(usd)) return '';
-  return `${colors.dim}$${usd.toFixed(2)}${colors.reset}`;
+  const { today, total } = updateAndReadCosts(data?.session_id || '', usd);
+  const d = colors.dim, r = colors.reset;
+  let s = `${d}$${usd.toFixed(2)} session${r}`;
+  if (today > 0) s += ` : ${d}$${today.toFixed(2)} today${r}`;
+  if (total > 0) s += ` : ${d}$${total.toFixed(2)} total${r}`;
+  return s;
 }
 
 function getCurrentTask(sessionId) {
